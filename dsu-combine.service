@@ -1,0 +1,13 @@
+[Unit]
+Description=DSU combiner (SteamDeckGyroDSU + Steam-Controller-GyroDSU on one port)
+After=network.target
+
+[Service]
+Type=simple
+# Adjust the path below if you put dsu_combine.py somewhere other than $HOME/dsu-combine
+ExecStart=/usr/bin/python3 %h/dsu-combine/dsu_combine.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
