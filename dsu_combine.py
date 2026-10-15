@@ -59,10 +59,9 @@ and leave it there, permanently.
 Protocol reference: https://v1993.github.io/cemuhook-protocol/
 """
 
-import asyncio
 import argparse
+import asyncio
 import logging
-import random
 import struct
 import time
 import zlib
@@ -130,17 +129,17 @@ def rebuild_as_slot0(server_id: int, msgtype: int, payload: bytes) -> bytes:
     real backends don't always set this consistently even while genuinely
     providing live data). Leave battery and everything past the shared
     header untouched."""
-    payload = bytearray(payload)
-    if payload:
-        payload[0] = VIRTUAL_SLOT
-    if len(payload) >= 2:
-        payload[1] = 2  # State: connected - forced, since we only ever call
-                         # this for a source we've already confirmed is live
-    if len(payload) >= 10:
-        payload[2] = FIXED_MODEL
-        payload[3] = FIXED_CONNTYPE
-        payload[4:10] = FIXED_MAC
-    return pack_dsu(MAGIC_SERVER, server_id, msgtype, bytes(payload))
+    buf = bytearray(payload)
+    if buf:
+        buf[0] = VIRTUAL_SLOT
+    if len(buf) >= 2:
+        buf[1] = 2  # State: connected - forced, since we only ever call
+                    # this for a source we've already confirmed is live
+    if len(buf) >= 10:
+        buf[2] = FIXED_MODEL
+        buf[3] = FIXED_CONNTYPE
+        buf[4:10] = FIXED_MAC
+    return pack_dsu(MAGIC_SERVER, server_id, msgtype, bytes(buf))
 
 
 def not_connected_reply(server_id: int) -> bytes:
@@ -205,16 +204,16 @@ class Combiner:
         self.server_id = server_id or FIXED_SERVER_ID
         self.debounce = debounce
 
-        self.last_controller_payload = None
+        self.last_controller_payload: bytes | None = None
         self.last_controller_ts = 0.0
-        self.last_deck_payload = None
+        self.last_deck_payload: bytes | None = None
         self.last_deck_ts = 0.0
         self._active_source = None   # "deck" / "controller" / None - for transition logging only
 
         self.pending_ports = {}   # backend_name -> asyncio.Future (cold-start fallback only)
         self.subscribers = {}     # client_addr -> last_seen
 
-        self.client_link: ClientLink = None
+        self.client_link: ClientLink | None = None
         self.backends = {}
 
     async def start(self):
@@ -264,6 +263,11 @@ class Combiner:
 
     # ---------------- client (emulator) side ----------------
 
+    def _send_to_client(self, data: bytes, addr):
+        # client_link is set in start() before any packet can arrive.
+        assert self.client_link is not None
+        self.client_link.send_to(data, addr)
+
     def on_client_packet(self, data: bytes, addr):
         pkt = parse_dsu(data)
         if pkt is None or pkt["magic"] != MAGIC_CLIENT:
@@ -274,7 +278,7 @@ class Combiner:
 
         if mt == MSG_VERSION:
             reply = pack_dsu(MAGIC_SERVER, self.server_id, MSG_VERSION, struct.pack("<H", PROTO_VERSION))
-            self.client_link.send_to(reply, addr)
+            self._send_to_client(reply, addr)
 
         elif mt == MSG_PORTS:
             asyncio.create_task(self._handle_ports_request(addr))
@@ -289,7 +293,7 @@ class Combiner:
         elif mt == MSG_MOTOR_INFO:
             shared = struct.pack("<BBBB6sB", 0, 0, 0, 0, b"\x00" * 6, 0)
             reply = pack_dsu(MAGIC_SERVER, self.server_id, MSG_MOTOR_INFO, shared + b"\x00")
-            self.client_link.send_to(reply, addr)
+            self._send_to_client(reply, addr)
 
         # MSG_MOTOR_RUMBLE: no-op, nothing to rumble.
 
@@ -309,12 +313,12 @@ class Combiner:
     async def _handle_ports_request_inner(self, addr):
         now = time.monotonic()
 
-        if self._controller_active(now):
+        if self.last_controller_payload is not None and self._controller_active(now):
             payload = ports_payload_from_shared(self.last_controller_payload)
             reply = rebuild_as_slot0(self.server_id, MSG_PORTS, payload)
             log.debug("ports-info reply to %s: source=controller(cached) state=%d model=%d bytes=%s",
                       addr, payload[1], payload[2], reply.hex())
-            self.client_link.send_to(reply, addr)
+            self._send_to_client(reply, addr)
             return
 
         if self.last_deck_payload is not None and (now - self.last_deck_ts) < CACHE_MAX_AGE_S:
@@ -322,7 +326,7 @@ class Combiner:
             reply = rebuild_as_slot0(self.server_id, MSG_PORTS, payload)
             log.debug("ports-info reply to %s: source=deck(cached) state=%d model=%d bytes=%s",
                       addr, payload[1], payload[2], reply.hex())
-            self.client_link.send_to(reply, addr)
+            self._send_to_client(reply, addr)
             return
 
         # Cold start: no streaming data cached yet at all - fall back to a
@@ -335,7 +339,7 @@ class Combiner:
                 reply = rebuild_as_slot0(self.server_id, MSG_PORTS, payload)
                 log.debug("ports-info reply to %s: source=controller(cold-start) state=%d bytes=%s",
                           addr, state, reply.hex())
-                self.client_link.send_to(reply, addr)
+                self._send_to_client(reply, addr)
                 return
 
         deck_reply = await self._query_backend_ports("deck")
@@ -343,11 +347,11 @@ class Combiner:
             payload, _state = deck_reply
             reply = rebuild_as_slot0(self.server_id, MSG_PORTS, payload)
             log.debug("ports-info reply to %s: source=deck(cold-start) bytes=%s", addr, reply.hex())
-            self.client_link.send_to(reply, addr)
+            self._send_to_client(reply, addr)
             return
 
         log.debug("ports-info reply to %s: NOT CONNECTED (no backend answered at all)", addr)
-        self.client_link.send_to(not_connected_reply(self.server_id), addr)
+        self._send_to_client(not_connected_reply(self.server_id), addr)
 
 
     async def _query_backend_ports(self, backend_name):
@@ -358,10 +362,12 @@ class Combiner:
         self.backends[backend_name].send(req)
         try:
             raw = await asyncio.wait_for(fut, timeout=PORTS_REQUEST_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.pending_ports.pop(backend_name, None)
             return None
         inner = parse_dsu(raw)
+        if inner is None:
+            return None
         payload = inner["payload"]
         state = payload[1] if len(payload) > 1 else 0
         return payload, state
@@ -414,7 +420,7 @@ class Combiner:
             out = rebuild_as_slot0(self.server_id, MSG_DATA, payload)
             for caddr, ts in list(self.subscribers.items()):
                 if now - ts < SUB_TIMEOUT_S:
-                    self.client_link.send_to(out, caddr)
+                    self._send_to_client(out, caddr)
                 else:
                     del self.subscribers[caddr]
 
